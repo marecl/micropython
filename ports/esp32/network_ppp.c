@@ -85,7 +85,9 @@ static void ppp_status_cb(ppp_pcb *pcb, int err_code, void *ctx) {
 }
 
 static mp_obj_t ppp_make_new(mp_obj_t stream) {
-    mp_get_stream_raise(stream, MP_STREAM_OP_READ | MP_STREAM_OP_WRITE);
+    if (stream != mp_const_none) {
+        mp_get_stream_raise(stream, MP_STREAM_OP_READ | MP_STREAM_OP_WRITE);
+    }
 
     ppp_if_obj_t *self = mp_obj_malloc_with_finaliser(ppp_if_obj_t, &ppp_if_type);
     self->stream = stream;
@@ -98,10 +100,21 @@ static mp_obj_t ppp_make_new(mp_obj_t stream) {
 }
 MP_DEFINE_CONST_FUN_OBJ_1(esp_network_ppp_make_new_obj, ppp_make_new);
 
-static u32_t ppp_output_callback(ppp_pcb *pcb, u8_t *data, u32_t len, void *ctx) {
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)
+static u32_t ppp_output_callback(ppp_pcb *pcb, const void *data, u32_t len, void *ctx)
+#else
+static u32_t ppp_output_callback(ppp_pcb *pcb, u8_t *data, u32_t len, void *ctx)
+#endif
+{
     ppp_if_obj_t *self = ctx;
+
+    mp_obj_t stream = self->stream;
+    if (stream == mp_const_none) {
+        return 0;
+    }
+
     int err;
-    return mp_stream_rw(self->stream, data, len, &err, MP_STREAM_RW_WRITE);
+    return mp_stream_rw(stream, (void *)data, len, &err, MP_STREAM_RW_WRITE);
 }
 
 static void pppos_client_task(void *self_in) {
@@ -110,10 +123,15 @@ static void pppos_client_task(void *self_in) {
 
     int len = 0;
     while (ulTaskNotifyTake(pdTRUE, len <= 0) == 0) {
-        int err;
-        len = mp_stream_rw(self->stream, buf, sizeof(buf), &err, 0);
-        if (len > 0) {
-            pppos_input_tcpip(self->pcb, (u8_t *)buf, len);
+        mp_obj_t stream = self->stream;
+        if (stream == mp_const_none) {
+            len = 0;
+        } else {
+            int err;
+            len = mp_stream_rw(stream, buf, sizeof(buf), &err, 0);
+            if (len > 0) {
+                pppos_input_tcpip(self->pcb, (u8_t *)buf, len);
+            }
         }
     }
 
@@ -266,6 +284,42 @@ static mp_obj_t ppp_ifconfig(size_t n_args, const mp_obj_t *args) {
 }
 MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(ppp_ifconfig_obj, 1, 2, ppp_ifconfig);
 
+static mp_obj_t ppp_ipconfig(size_t n_args, const mp_obj_t *args, mp_map_t *kwargs) {
+    if (kwargs->used == 0) {
+        ppp_if_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+        if (self->pcb == NULL) {
+            mp_raise_ValueError(MP_ERROR_TEXT("PPP not active"));
+        }
+        struct netif *netif = ppp_netif(self->pcb);
+        // Get config value
+        if (n_args != 2) {
+            mp_raise_TypeError(MP_ERROR_TEXT("must query one param"));
+        }
+
+        switch (mp_obj_str_get_qstr(args[1])) {
+            case MP_QSTR_addr4: {
+                mp_obj_t tuple[2] = {
+                    netutils_format_ipv4_addr((uint8_t *)&netif->ip_addr, NETUTILS_BIG),
+                    netutils_format_ipv4_addr((uint8_t *)&netif->netmask, NETUTILS_BIG),
+                };
+                return mp_obj_new_tuple(2, tuple);
+            }
+            case MP_QSTR_gw4: {
+                return netutils_format_ipv4_addr((uint8_t *)&netif->gw, NETUTILS_BIG);
+            }
+            default: {
+                mp_raise_ValueError(MP_ERROR_TEXT("unexpected key"));
+                break;
+            }
+        }
+        return mp_const_none;
+    } else {
+        mp_raise_TypeError(MP_ERROR_TEXT("setting properties not supported"));
+    }
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_KW(ppp_ipconfig_obj, 1, ppp_ipconfig);
+
 static mp_obj_t ppp_status(mp_obj_t self_in) {
     return mp_const_none;
 }
@@ -287,6 +341,13 @@ static mp_obj_t ppp_config(size_t n_args, const mp_obj_t *args, mp_map_t *kwargs
         for (size_t i = 0; i < kwargs->alloc; i++) {
             if (mp_map_slot_is_filled(kwargs, i)) {
                 switch (mp_obj_str_get_qstr(kwargs->table[i].key)) {
+                    case MP_QSTR_stream: {
+                        if (kwargs->table[i].value != mp_const_none) {
+                            mp_get_stream_raise(kwargs->table[i].value, MP_STREAM_OP_READ | MP_STREAM_OP_WRITE);
+                        }
+                        self->stream = kwargs->table[i].value;
+                        break;
+                    }
                     default:
                         break;
                 }
@@ -302,13 +363,17 @@ static mp_obj_t ppp_config(size_t n_args, const mp_obj_t *args, mp_map_t *kwargs
     mp_obj_t val = mp_const_none;
 
     switch (mp_obj_str_get_qstr(args[1])) {
+        case MP_QSTR_stream: {
+            val = self->stream;
+            break;
+        }
         case MP_QSTR_ifname: {
             if (self->pcb != NULL) {
                 struct netif *pppif = ppp_netif(self->pcb);
                 char ifname[NETIF_NAMESIZE + 1] = {0};
                 netif_index_to_name(netif_get_index(pppif), ifname);
                 if (ifname[0] != 0) {
-                    val = mp_obj_new_str((char *)ifname, strlen(ifname));
+                    val = mp_obj_new_str_from_cstr((char *)ifname);
                 }
             }
             break;
@@ -328,6 +393,7 @@ static const mp_rom_map_elem_t ppp_if_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_status), MP_ROM_PTR(&ppp_status_obj) },
     { MP_ROM_QSTR(MP_QSTR_config), MP_ROM_PTR(&ppp_config_obj) },
     { MP_ROM_QSTR(MP_QSTR_ifconfig), MP_ROM_PTR(&ppp_ifconfig_obj) },
+    { MP_ROM_QSTR(MP_QSTR_ipconfig), MP_ROM_PTR(&ppp_ipconfig_obj) },
     { MP_ROM_QSTR(MP_QSTR___del__), MP_ROM_PTR(&ppp_delete_obj) },
     { MP_ROM_QSTR(MP_QSTR_AUTH_NONE), MP_ROM_INT(PPPAUTHTYPE_NONE) },
     { MP_ROM_QSTR(MP_QSTR_AUTH_PAP), MP_ROM_INT(PPPAUTHTYPE_PAP) },

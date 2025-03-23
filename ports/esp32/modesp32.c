@@ -29,7 +29,6 @@
 
 #include <time.h>
 #include <sys/time.h>
-#include "soc/rtc_cntl_reg.h"
 #include "driver/gpio.h"
 #include "driver/adc.h"
 #include "esp_heap_caps.h"
@@ -54,7 +53,6 @@ static mp_obj_t esp32_wake_on_touch(const mp_obj_t wake) {
     if (machine_rtc_config.ext0_pin != -1) {
         mp_raise_ValueError(MP_ERROR_TEXT("no resources"));
     }
-    // mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("touchpad wakeup not available for this version of ESP-IDF"));
 
     machine_rtc_config.wake_on_touch = mp_obj_is_true(wake);
     return mp_const_none;
@@ -138,6 +136,7 @@ static mp_obj_t esp32_wake_on_ulp(const mp_obj_t wake) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(esp32_wake_on_ulp_obj, esp32_wake_on_ulp);
 
+#if !SOC_GPIO_SUPPORT_HOLD_SINGLE_IO_IN_DSLP
 static mp_obj_t esp32_gpio_deep_sleep_hold(const mp_obj_t enable) {
     if (mp_obj_is_true(enable)) {
         gpio_deep_sleep_hold_en();
@@ -147,6 +146,7 @@ static mp_obj_t esp32_gpio_deep_sleep_hold(const mp_obj_t enable) {
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(esp32_gpio_deep_sleep_hold_obj, esp32_gpio_deep_sleep_hold);
+#endif
 
 #if CONFIG_IDF_TARGET_ESP32
 
@@ -167,6 +167,26 @@ static mp_obj_t esp32_raw_temperature(void) {
     return mp_obj_new_int(res);
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(esp32_raw_temperature_obj, esp32_raw_temperature);
+
+#else
+
+// IDF 5 exposes new internal temperature interface, and the ESP32C3/S2/S3
+// now have calibrated temperature settings in 5 discrete ranges.
+#include "driver/temperature_sensor.h"
+
+static mp_obj_t esp32_mcu_temperature(void) {
+    static temperature_sensor_handle_t temp_sensor = NULL;
+    float tvalue;
+    if (temp_sensor == NULL) {
+        temperature_sensor_config_t temp_sensor_config = TEMPERATURE_SENSOR_CONFIG_DEFAULT(-10, 80);
+        ESP_ERROR_CHECK(temperature_sensor_install(&temp_sensor_config, &temp_sensor));
+    }
+    ESP_ERROR_CHECK(temperature_sensor_enable(temp_sensor));
+    ESP_ERROR_CHECK(temperature_sensor_get_celsius(temp_sensor, &tvalue));
+    ESP_ERROR_CHECK(temperature_sensor_disable(temp_sensor));
+    return mp_obj_new_int((int)(tvalue + 0.5));
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(esp32_mcu_temperature_obj, esp32_mcu_temperature);
 
 #endif
 
@@ -199,9 +219,13 @@ static const mp_rom_map_elem_t esp32_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_wake_on_ext0), MP_ROM_PTR(&esp32_wake_on_ext0_obj) },
     { MP_ROM_QSTR(MP_QSTR_wake_on_ext1), MP_ROM_PTR(&esp32_wake_on_ext1_obj) },
     { MP_ROM_QSTR(MP_QSTR_wake_on_ulp), MP_ROM_PTR(&esp32_wake_on_ulp_obj) },
+    #if !SOC_GPIO_SUPPORT_HOLD_SINGLE_IO_IN_DSLP
     { MP_ROM_QSTR(MP_QSTR_gpio_deep_sleep_hold), MP_ROM_PTR(&esp32_gpio_deep_sleep_hold_obj) },
+    #endif
     #if CONFIG_IDF_TARGET_ESP32
     { MP_ROM_QSTR(MP_QSTR_raw_temperature), MP_ROM_PTR(&esp32_raw_temperature_obj) },
+    #else
+    { MP_ROM_QSTR(MP_QSTR_mcu_temperature), MP_ROM_PTR(&esp32_mcu_temperature_obj) },
     #endif
     { MP_ROM_QSTR(MP_QSTR_idf_heap_info), MP_ROM_PTR(&esp32_idf_heap_info_obj) },
 
