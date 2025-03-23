@@ -5,9 +5,9 @@ MPY_DIR = ../../..
 MOD = btree_$(ARCH)
 
 # Source files (.c or .py)
-SRC = btree_c.c btree_py.py
+SRC = btree_c.c
 
-# Architecture to build for (x86, x64, armv7m, xtensa, xtensawin)
+# Architecture to build for (x86, x64, armv7m, xtensa, xtensawin, rv32imc)
 ARCH = x64
 
 BTREE_DIR = $(MPY_DIR)/lib/berkeley-db-1.xx

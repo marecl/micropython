@@ -32,6 +32,9 @@
 #include "py/runtime.h"
 #include "proxy_c.h"
 
+// Number of static entries at the start of proxy_c_ref.
+#define PROXY_C_REF_NUM_STATIC (1)
+
 // These constants should match the constants in proxy_js.js.
 
 enum {
@@ -46,6 +49,7 @@ enum {
     PROXY_KIND_MP_GENERATOR = 7,
     PROXY_KIND_MP_OBJECT = 8,
     PROXY_KIND_MP_JSPROXY = 9,
+    PROXY_KIND_MP_EXISTING = 10,
 };
 
 enum {
@@ -71,21 +75,84 @@ static const mp_obj_base_t mp_const_undefined_obj = {&mp_type_undefined};
 
 MP_DEFINE_EXCEPTION(JsException, Exception)
 
+// Index to start searching for the next available slot in proxy_c_ref.
+static size_t proxy_c_ref_next;
+
 void proxy_c_init(void) {
     MP_STATE_PORT(proxy_c_ref) = mp_obj_new_list(0, NULL);
+    MP_STATE_PORT(proxy_c_dict) = mp_obj_new_dict(0);
     mp_obj_list_append(MP_STATE_PORT(proxy_c_ref), MP_OBJ_NULL);
+    proxy_c_ref_next = PROXY_C_REF_NUM_STATIC;
 }
 
 MP_REGISTER_ROOT_POINTER(mp_obj_t proxy_c_ref);
+MP_REGISTER_ROOT_POINTER(mp_obj_t proxy_c_dict);
 
+// obj cannot be MP_OBJ_NULL.
 static inline size_t proxy_c_add_obj(mp_obj_t obj) {
-    size_t id = ((mp_obj_list_t *)MP_OBJ_TO_PTR(MP_STATE_PORT(proxy_c_ref)))->len;
-    mp_obj_list_append(MP_STATE_PORT(proxy_c_ref), obj);
+    // Search for the first free slot in proxy_c_ref.
+    size_t id = 0;
+    mp_obj_list_t *l = (mp_obj_list_t *)MP_OBJ_TO_PTR(MP_STATE_PORT(proxy_c_ref));
+    while (proxy_c_ref_next < l->len) {
+        if (l->items[proxy_c_ref_next] == MP_OBJ_NULL) {
+            // Free slot found, reuse it.
+            id = proxy_c_ref_next;
+            ++proxy_c_ref_next;
+            l->items[id] = obj;
+            break;
+        }
+        ++proxy_c_ref_next;
+    }
+
+    if (id == 0) {
+        // No free slots, so grow proxy_c_ref by one (append at the end of the list).
+        id = l->len;
+        mp_obj_list_append(MP_STATE_PORT(proxy_c_ref), obj);
+        proxy_c_ref_next = l->len;
+    }
+
+    // Add the object to proxy_c_dict, keyed by the object pointer, with value the object id.
+    mp_obj_t obj_key = mp_obj_new_int_from_uint((uintptr_t)obj);
+    mp_map_elem_t *elem = mp_map_lookup(mp_obj_dict_get_map(MP_STATE_PORT(proxy_c_dict)), obj_key, MP_MAP_LOOKUP_ADD_IF_NOT_FOUND);
+    elem->value = mp_obj_new_int_from_uint(id);
+
     return id;
+}
+
+EM_JS(int, js_check_existing, (int c_ref), {
+    return proxy_js_check_existing(c_ref);
+});
+
+// obj cannot be MP_OBJ_NULL.
+static inline int proxy_c_check_existing(mp_obj_t obj) {
+    mp_obj_t obj_key = mp_obj_new_int_from_uint((uintptr_t)obj);
+    mp_map_elem_t *elem = mp_map_lookup(mp_obj_dict_get_map(MP_STATE_PORT(proxy_c_dict)), obj_key, MP_MAP_LOOKUP);
+    if (elem == NULL) {
+        return -1;
+    }
+    uint32_t c_ref = mp_obj_int_get_truncated(elem->value);
+    return js_check_existing(c_ref);
 }
 
 static inline mp_obj_t proxy_c_get_obj(uint32_t c_ref) {
     return ((mp_obj_list_t *)MP_OBJ_TO_PTR(MP_STATE_PORT(proxy_c_ref)))->items[c_ref];
+}
+
+void proxy_c_free_obj(uint32_t c_ref) {
+    if (c_ref >= PROXY_C_REF_NUM_STATIC) {
+        // Remove the object from proxy_c_dict if the c_ref in that dict corresponds to this object.
+        // (It may be that this object exists in the dict but with a different c_ref from a more
+        // recent proxy of this object.)
+        mp_obj_t obj_key = mp_obj_new_int_from_uint((uintptr_t)proxy_c_get_obj(c_ref));
+        mp_map_elem_t *elem = mp_map_lookup(mp_obj_dict_get_map(MP_STATE_PORT(proxy_c_dict)), obj_key, MP_MAP_LOOKUP);
+        if (elem != NULL && mp_obj_int_get_truncated(elem->value) == c_ref) {
+            mp_map_lookup(mp_obj_dict_get_map(MP_STATE_PORT(proxy_c_dict)), obj_key, MP_MAP_LOOKUP_REMOVE_IF_FOUND);
+        }
+
+        // Clear the slot in proxy_c_ref used by this object, so the GC can reclaim the object.
+        ((mp_obj_list_t *)MP_OBJ_TO_PTR(MP_STATE_PORT(proxy_c_ref)))->items[c_ref] = MP_OBJ_NULL;
+        proxy_c_ref_next = MIN(proxy_c_ref_next, c_ref);
+    }
 }
 
 mp_obj_t proxy_convert_js_to_mp_obj_cside(uint32_t *value) {
@@ -113,6 +180,7 @@ mp_obj_t proxy_convert_js_to_mp_obj_cside(uint32_t *value) {
 
 void proxy_convert_mp_to_js_obj_cside(mp_obj_t obj, uint32_t *out) {
     uint32_t kind;
+    int js_ref;
     if (obj == MP_OBJ_NULL) {
         kind = PROXY_KIND_MP_NULL;
     } else if (obj == mp_const_none) {
@@ -138,6 +206,9 @@ void proxy_convert_mp_to_js_obj_cside(mp_obj_t obj, uint32_t *out) {
     } else if (mp_obj_is_jsproxy(obj)) {
         kind = PROXY_KIND_MP_JSPROXY;
         out[1] = mp_obj_jsproxy_get_ref(obj);
+    } else if ((js_ref = proxy_c_check_existing(obj)) >= 0) {
+        kind = PROXY_KIND_MP_EXISTING;
+        out[1] = js_ref;
     } else if (mp_obj_get_type(obj) == &mp_type_JsException) {
         mp_obj_exception_t *exc = MP_OBJ_TO_PTR(obj);
         if (exc->args->len > 0 && mp_obj_is_jsproxy(exc->args->items[0])) {
@@ -176,6 +247,7 @@ void proxy_convert_mp_to_js_exc_cside(void *exc, uint32_t *out) {
 }
 
 void proxy_c_to_js_call(uint32_t c_ref, uint32_t n_args, uint32_t *args_value, uint32_t *out) {
+    external_call_depth_inc();
     nlr_buf_t nlr;
     if (nlr_push(&nlr) == 0) {
         mp_obj_t args[n_args];
@@ -185,14 +257,17 @@ void proxy_c_to_js_call(uint32_t c_ref, uint32_t n_args, uint32_t *args_value, u
         mp_obj_t obj = proxy_c_get_obj(c_ref);
         mp_obj_t member = mp_call_function_n_kw(obj, n_args, 0, args);
         nlr_pop();
+        external_call_depth_dec();
         proxy_convert_mp_to_js_obj_cside(member, out);
     } else {
         // uncaught exception
+        external_call_depth_dec();
         proxy_convert_mp_to_js_exc_cside(nlr.ret_val, out);
     }
 }
 
 void proxy_c_to_js_dir(uint32_t c_ref, uint32_t *out) {
+    external_call_depth_inc();
     nlr_buf_t nlr;
     if (nlr_push(&nlr) == 0) {
         mp_obj_t obj = proxy_c_get_obj(c_ref);
@@ -210,10 +285,12 @@ void proxy_c_to_js_dir(uint32_t c_ref, uint32_t *out) {
             dir = mp_builtin_dir_obj.fun.var(1, args);
         }
         nlr_pop();
-        return proxy_convert_mp_to_js_obj_cside(dir, out);
+        external_call_depth_dec();
+        proxy_convert_mp_to_js_obj_cside(dir, out);
     } else {
         // uncaught exception
-        return proxy_convert_mp_to_js_exc_cside(nlr.ret_val, out);
+        external_call_depth_dec();
+        proxy_convert_mp_to_js_exc_cside(nlr.ret_val, out);
     }
 }
 
@@ -235,6 +312,7 @@ bool proxy_c_to_js_has_attr(uint32_t c_ref, const char *attr_in) {
 }
 
 void proxy_c_to_js_lookup_attr(uint32_t c_ref, const char *attr_in, uint32_t *out) {
+    external_call_depth_inc();
     nlr_buf_t nlr;
     if (nlr_push(&nlr) == 0) {
         mp_obj_t obj = proxy_c_get_obj(c_ref);
@@ -255,19 +333,27 @@ void proxy_c_to_js_lookup_attr(uint32_t c_ref, const char *attr_in, uint32_t *ou
             member = mp_load_attr(obj, attr);
         }
         nlr_pop();
-        return proxy_convert_mp_to_js_obj_cside(member, out);
+        external_call_depth_dec();
+        proxy_convert_mp_to_js_obj_cside(member, out);
     } else {
         // uncaught exception
-        return proxy_convert_mp_to_js_exc_cside(nlr.ret_val, out);
+        external_call_depth_dec();
+        proxy_convert_mp_to_js_exc_cside(nlr.ret_val, out);
     }
 }
 
-static bool proxy_c_to_js_store_helper(uint32_t c_ref, const char *attr_in, mp_obj_t value) {
-    mp_obj_t obj = proxy_c_get_obj(c_ref);
-    qstr attr = qstr_from_str(attr_in);
-
+static bool proxy_c_to_js_store_helper(uint32_t c_ref, const char *attr_in, uint32_t *value_in) {
+    external_call_depth_inc();
     nlr_buf_t nlr;
     if (nlr_push(&nlr) == 0) {
+        mp_obj_t obj = proxy_c_get_obj(c_ref);
+        qstr attr = qstr_from_str(attr_in);
+
+        mp_obj_t value = MP_OBJ_NULL;
+        if (value_in != NULL) {
+            value = proxy_convert_js_to_mp_obj_cside(value_in);
+        }
+
         if (mp_obj_is_dict_or_ordereddict(obj)) {
             if (value == MP_OBJ_NULL) {
                 mp_obj_dict_delete(obj, MP_OBJ_NEW_QSTR(attr));
@@ -278,20 +364,21 @@ static bool proxy_c_to_js_store_helper(uint32_t c_ref, const char *attr_in, mp_o
             mp_store_attr(obj, attr, value);
         }
         nlr_pop();
+        external_call_depth_dec();
         return true;
     } else {
         // uncaught exception
+        external_call_depth_dec();
         return false;
     }
 }
 
 bool proxy_c_to_js_store_attr(uint32_t c_ref, const char *attr_in, uint32_t *value_in) {
-    mp_obj_t value = proxy_convert_js_to_mp_obj_cside(value_in);
-    return proxy_c_to_js_store_helper(c_ref, attr_in, value);
+    return proxy_c_to_js_store_helper(c_ref, attr_in, value_in);
 }
 
 bool proxy_c_to_js_delete_attr(uint32_t c_ref, const char *attr_in) {
-    return proxy_c_to_js_store_helper(c_ref, attr_in, MP_OBJ_NULL);
+    return proxy_c_to_js_store_helper(c_ref, attr_in, NULL);
 }
 
 uint32_t proxy_c_to_js_get_type(uint32_t c_ref) {
@@ -352,18 +439,22 @@ uint32_t proxy_c_to_js_get_iter(uint32_t c_ref) {
 }
 
 bool proxy_c_to_js_iternext(uint32_t c_ref, uint32_t *out) {
-    mp_obj_t obj = proxy_c_get_obj(c_ref);
+    external_call_depth_inc();
     nlr_buf_t nlr;
     if (nlr_push(&nlr) == 0) {
+        mp_obj_t obj = proxy_c_get_obj(c_ref);
         mp_obj_t iter = mp_iternext_allow_raise(obj);
         if (iter == MP_OBJ_STOP_ITERATION) {
+            external_call_depth_dec();
             nlr_pop();
             return false;
         }
         nlr_pop();
+        external_call_depth_dec();
         proxy_convert_mp_to_js_obj_cside(iter, out);
         return true;
     } else {
+        external_call_depth_dec();
         if (mp_obj_is_subclass_fast(MP_OBJ_FROM_PTR(((mp_obj_base_t *)nlr.ret_val)->type), MP_OBJ_FROM_PTR(&mp_type_StopIteration))) {
             return false;
         } else {
@@ -420,6 +511,12 @@ EM_JS(void, js_then_continue, (int jsref, uint32_t * py_resume, uint32_t * resol
 });
 // *FORMAT-ON*
 
+EM_JS(void, create_promise, (uint32_t * out_set, uint32_t * out_promise), {
+    const out_set_js = proxy_convert_mp_to_js_obj_jsside(out_set);
+    const promise = new Promise(out_set_js);
+    proxy_convert_js_to_mp_obj_jsside(promise, out_promise);
+});
+
 static mp_obj_t proxy_resume_execute(mp_obj_t self_in, mp_obj_t send_value, mp_obj_t throw_value, mp_obj_t resolve, mp_obj_t reject) {
     if (throw_value != MP_OBJ_NULL && throw_value != mp_const_none) {
         if (send_value == mp_const_none) {
@@ -433,6 +530,9 @@ static mp_obj_t proxy_resume_execute(mp_obj_t self_in, mp_obj_t send_value, mp_o
         }
     } else {
         throw_value = MP_OBJ_NULL;
+        if (send_value == mp_const_undefined) {
+            send_value = mp_const_none;
+        }
     }
 
     mp_obj_t ret_value;
@@ -446,7 +546,29 @@ static mp_obj_t proxy_resume_execute(mp_obj_t self_in, mp_obj_t send_value, mp_o
         js_then_resolve(out_ret_value, out_resolve);
         return mp_const_none;
     } else if (ret_kind == MP_VM_RETURN_YIELD) {
-        // ret_value should be a JS thenable
+        // If ret_value is None then there has been a top-level await of an asyncio primitive.
+        // Otherwise, ret_value should be a JS thenable.
+
+        if (ret_value == mp_const_none) {
+            // Waiting on an asyncio primitive to complete, eg a Task or Event.
+            //
+            // Completion of this primitive will occur when the asyncio.core._top_level_task
+            // Task is made runable and its coroutine's send() method is called.  Need to
+            // construct a Promise that resolves when that send() method is called, because
+            // that will resume the top-level await from the JavaScript side.
+            //
+            // This is accomplished via the asyncio.core.TopLevelCoro class and its methods.
+            mp_obj_t asyncio = mp_import_name(MP_QSTR_asyncio_dot_core, mp_const_none, MP_OBJ_NEW_SMALL_INT(0));
+            mp_obj_t asyncio_core = mp_load_attr(asyncio, MP_QSTR_core);
+            mp_obj_t top_level_coro = mp_load_attr(asyncio_core, MP_QSTR_TopLevelCoro);
+            mp_obj_t top_level_coro_set = mp_load_attr(top_level_coro, MP_QSTR_set);
+            uint32_t out_set[PVN];
+            proxy_convert_mp_to_js_obj_cside(top_level_coro_set, out_set);
+            uint32_t out_promise[PVN];
+            create_promise(out_set, out_promise);
+            ret_value = proxy_convert_js_to_mp_obj_cside(out_promise);
+        }
+
         mp_obj_t py_resume = mp_obj_new_bound_meth(MP_OBJ_FROM_PTR(&resume_obj), self_in);
         int ref = mp_obj_jsproxy_get_ref(ret_value);
         uint32_t out_py_resume[PVN];
@@ -475,6 +597,7 @@ static mp_obj_t resume_fun(size_t n_args, const mp_obj_t *args) {
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(resume_obj, 5, 5, resume_fun);
 
 void proxy_c_to_js_resume(uint32_t c_ref, uint32_t *args) {
+    external_call_depth_inc();
     nlr_buf_t nlr;
     if (nlr_push(&nlr) == 0) {
         mp_obj_t obj = proxy_c_get_obj(c_ref);
@@ -482,9 +605,11 @@ void proxy_c_to_js_resume(uint32_t c_ref, uint32_t *args) {
         mp_obj_t reject = proxy_convert_js_to_mp_obj_cside(args + 2 * 3);
         mp_obj_t ret = proxy_resume_execute(obj, mp_const_none, mp_const_none, resolve, reject);
         nlr_pop();
-        return proxy_convert_mp_to_js_obj_cside(ret, args);
+        external_call_depth_dec();
+        proxy_convert_mp_to_js_obj_cside(ret, args);
     } else {
         // uncaught exception
-        return proxy_convert_mp_to_js_exc_cside(nlr.ret_val, args);
+        external_call_depth_dec();
+        proxy_convert_mp_to_js_exc_cside(nlr.ret_val, args);
     }
 }

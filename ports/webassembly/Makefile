@@ -54,6 +54,7 @@ EXPORTED_FUNCTIONS_EXTRA += ,\
 	_mp_js_do_exec_async,\
 	_mp_js_do_import,\
 	_mp_js_register_js_module,\
+	_proxy_c_free_obj,\
 	_proxy_c_init,\
 	_proxy_c_to_js_call,\
 	_proxy_c_to_js_delete_attr,\
@@ -147,10 +148,10 @@ repl: $(BUILD)/micropython.mjs
 min: $(BUILD)/micropython.min.mjs
 
 test: $(BUILD)/micropython.mjs $(TOP)/tests/run-tests.py
-	cd $(TOP)/tests && MICROPY_MICROPYTHON_MJS=../ports/webassembly/$< ./run-tests.py --target webassembly
+	cd $(TOP)/tests && MICROPY_MICROPYTHON_MJS=../ports/webassembly/$< ./run-tests.py -t webassembly
 
 test_min: $(BUILD)/micropython.min.mjs $(TOP)/tests/run-tests.py
-	cd $(TOP)/tests && MICROPY_MICROPYTHON_MJS=../ports/webassembly/$< ./run-tests.py --target webassembly
+	cd $(TOP)/tests && MICROPY_MICROPYTHON_MJS=../ports/webassembly/$< ./run-tests.py -t webassembly
 
 ################################################################################
 # Remaining make rules.
